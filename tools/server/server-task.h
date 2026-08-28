@@ -166,6 +166,7 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        std::string ram_filepath; // empty when --save-ram-path is not set
     };
     slot_action slot_action;
 
@@ -526,6 +527,12 @@ struct server_task_result_slot_save_load : server_task_result {
     size_t n_bytes;
     double t_ms;
 
+    // prompt cache snapshot part, only set when --save-ram-path is enabled
+    bool   ram_active = false;
+    size_t n_ram_entries = 0;
+    size_t n_ram_bytes   = 0;
+    double t_ram_ms      = 0.0;
+
     virtual json to_json() override;
 };
 
@@ -609,6 +616,59 @@ struct server_prompt_cache_state {
     }
 };
 
+// compatibility descriptor of a warm-restart prompt cache snapshot
+struct server_prompt_cache_compat {
+    std::string build_info;
+
+    // target model identity
+    std::string model_path;
+    uint64_t    model_file_size  = 0;
+    uint64_t    model_file_mtime = 0;
+    std::string model_desc;
+    uint64_t    model_n_params   = 0;
+    uint64_t    model_size       = 0;
+    int32_t     model_ftype      = -1;
+
+    // optional draft model identity
+    bool        has_draft = false;
+    std::string draft_path;
+    uint64_t    draft_file_size  = 0;
+    uint64_t    draft_file_mtime = 0;
+    std::string draft_desc;
+    int32_t     draft_cache_type_k = 0;
+    int32_t     draft_cache_type_v = 0;
+
+    // optional multimodal identity
+    bool        has_mmproj = false;
+    std::string mmproj_path;
+    uint64_t    mmproj_file_size  = 0;
+    uint64_t    mmproj_file_mtime = 0;
+
+    // effective context / KV configuration
+    int32_t n_ctx           = 0;
+    int32_t n_ctx_slot      = 0;
+    int32_t cache_type_k    = 0;
+    int32_t cache_type_v    = 0;
+    bool    kv_unified      = false;
+    int32_t flash_attn_type = 0;
+    int32_t n_swa           = 0;
+
+    // RoPE configuration
+    float   rope_freq_base    = 0.0f;
+    float   rope_freq_scale   = 0.0f;
+    float   yarn_ext_factor   = 0.0f;
+    float   yarn_attn_factor  = 0.0f;
+    float   yarn_beta_fast    = 0.0f;
+    float   yarn_beta_slow    = 0.0f;
+    int32_t yarn_orig_ctx     = 0;
+    int32_t rope_scaling_type = 0;
+
+    // speculative configuration
+    bool                 has_spec = false;
+    std::vector<int32_t> spec_types;
+    int32_t              spec_draft_n_max = 0;
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -629,10 +689,23 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, float slot_similarity);
 
     void update();
+
+    // serialize the whole cache into a warm-restart snapshot buffer
+    // returns false on error, in which case `out` is untouched
+    bool snapshot_save(std::vector<uint8_t> & out, const server_prompt_cache_compat & compat) const;
+
+    // parse a warm-restart snapshot buffer and load its entries into this cache, applying the
+    // current byte and token limits
+    // returns false when the buffer is invalid or incompatible, leaving this cache unchanged
+    bool snapshot_load(const uint8_t * data, size_t size, const server_prompt_cache_compat & compat,
+                       const llama_context * ctx_tgt, bool has_mtmd, int32_t n_ctx, int32_t n_ctx_slot);
 };
+
+// atomically write a snapshot buffer to `filepath` using a sibling temp file that is renamed on success
+bool server_prompt_cache_snapshot_save_file(const std::string & filepath, const std::vector<uint8_t> & data);
 
 // used exclusively by router mode
 struct server_task_result_router : server_task_result {
