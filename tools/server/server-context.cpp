@@ -322,8 +322,8 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, float slot_similarity) {
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, slot_similarity);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1646,7 +1646,7 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (!ret->prompt_load(*prompt_cache, task.tokens, slot_prompt_similarity)) {
                     ret->prompt_clear();
                 }
 
@@ -2541,6 +2541,21 @@ private:
                         break;
                     }
 
+                    // save the prompt cache snapshot first so a failure does not leave a
+                    // slot file without a matching snapshot
+                    double t_ram_ms = 0.0;
+                    size_t n_ram_entries = 0;
+                    size_t n_ram_bytes   = 0;
+                    if (!params_base.save_ram_path.empty()) {
+                        std::string err;
+                        const int64_t t_ram_start = ggml_time_us();
+                        if (!save_prompt_cache(task.slot_action.ram_filepath, err, n_ram_entries, n_ram_bytes)) {
+                            send_error(task, "Unable to save prompt cache snapshot: " + err, ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        t_ram_ms = (ggml_time_us() - t_ram_start) / 1000.0;
+                    }
+
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
@@ -2574,6 +2589,10 @@ private:
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nwrite;
                     res->t_ms     = t_save_ms;
+                    res->ram_active     = !params_base.save_ram_path.empty();
+                    res->n_ram_entries  = n_ram_entries;
+                    res->n_ram_bytes    = n_ram_bytes;
+                    res->t_ram_ms       = t_ram_ms;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
@@ -2631,6 +2650,21 @@ private:
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
+                    // load the prompt cache snapshot after the slot restore succeeds,
+                    // so a failure leaves the slot restored
+                    double t_ram_ms = 0.0;
+                    size_t n_ram_entries = 0;
+                    size_t n_ram_bytes   = 0;
+                    if (!params_base.save_ram_path.empty()) {
+                        std::string err;
+                        const int64_t t_ram_start = ggml_time_us();
+                        if (!load_prompt_cache_snapshot(task.slot_action.ram_filepath, err, n_ram_entries, n_ram_bytes)) {
+                            send_error(task, "Unable to load prompt cache snapshot: " + err, ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        t_ram_ms = (ggml_time_us() - t_ram_start) / 1000.0;
+                    }
+
                     auto res = std::make_unique<server_task_result_slot_save_load>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
@@ -2639,6 +2673,10 @@ private:
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nread;
                     res->t_ms     = t_restore_ms;
+                    res->ram_active     = !params_base.save_ram_path.empty();
+                    res->n_ram_entries  = n_ram_entries;
+                    res->n_ram_bytes    = n_ram_bytes;
+                    res->t_ram_ms       = t_ram_ms;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
@@ -4018,6 +4056,203 @@ private:
         return std::min(res, llama_model_n_ctx_train(model_tgt));
     }
 
+    // file size in bytes, 0 when the file cannot be inspected
+    static uint64_t get_file_size(const std::string & path) {
+        std::error_code ec;
+        const uintmax_t size = std::filesystem::file_size(path, ec);
+        return ec ? 0 : (uint64_t) size;
+    }
+
+    // file modification time as an opaque fingerprint, 0 when it cannot be inspected
+    static uint64_t get_file_mtime(const std::string & path) {
+        std::error_code ec;
+        const auto mtime = std::filesystem::last_write_time(path, ec);
+        if (ec) {
+            return 0;
+        }
+        return (uint64_t) mtime.time_since_epoch().count();
+    }
+
+    // compatibility descriptor for the warm-restart prompt cache snapshot
+    // note: requires model/context to be alive, do not call while sleeping
+    server_prompt_cache_compat build_prompt_cache_compat() const {
+        server_prompt_cache_compat c;
+
+        c.build_info = llama_build_info();
+
+        c.model_path       = params_base.model.path;
+        c.model_file_size  = get_file_size(params_base.model.path);
+        c.model_file_mtime = get_file_mtime(params_base.model.path);
+        {
+            char buf[256];
+            llama_model_desc(model_tgt, buf, sizeof(buf));
+            c.model_desc = buf;
+        }
+        c.model_n_params = llama_model_n_params(model_tgt);
+        c.model_size     = llama_model_size(model_tgt);
+        c.model_ftype    = llama_model_ftype(model_tgt);
+
+        c.has_draft = model_dft != nullptr;
+        if (c.has_draft) {
+            const auto & mdft = params_base.speculative.draft.mparams;
+            c.draft_path         = mdft.path;
+            c.draft_file_size    = get_file_size(mdft.path);
+            c.draft_file_mtime   = get_file_mtime(mdft.path);
+            {
+                char buf[256];
+                llama_model_desc(model_dft, buf, sizeof(buf));
+                c.draft_desc = buf;
+            }
+            c.draft_cache_type_k = params_base.speculative.draft.cache_type_k;
+            c.draft_cache_type_v = params_base.speculative.draft.cache_type_v;
+        }
+
+        c.has_mmproj = mctx != nullptr;
+        if (c.has_mmproj) {
+            c.mmproj_path       = params_base.mmproj.path;
+            c.mmproj_file_size  = get_file_size(params_base.mmproj.path);
+            c.mmproj_file_mtime = get_file_mtime(params_base.mmproj.path);
+        }
+
+        c.n_ctx            = n_ctx;
+        c.n_ctx_slot       = n_ctx_slot();
+        c.cache_type_k     = params_base.cache_type_k;
+        c.cache_type_v     = params_base.cache_type_v;
+        c.kv_unified       = params_base.kv_unified;
+        c.flash_attn_type  = params_base.flash_attn_type;
+        c.n_swa            = n_swa;
+
+        c.rope_freq_base    = params_base.rope_freq_base;
+        c.rope_freq_scale   = params_base.rope_freq_scale;
+        c.yarn_ext_factor   = params_base.yarn_ext_factor;
+        c.yarn_attn_factor  = params_base.yarn_attn_factor;
+        c.yarn_beta_fast    = params_base.yarn_beta_fast;
+        c.yarn_beta_slow    = params_base.yarn_beta_slow;
+        c.yarn_orig_ctx     = params_base.yarn_orig_ctx;
+        c.rope_scaling_type = params_base.rope_scaling_type;
+
+        c.has_spec = spec != nullptr;
+        if (c.has_spec) {
+            for (const auto t : params_base.speculative.types) {
+                c.spec_types.push_back((int32_t) t);
+            }
+            c.spec_draft_n_max = params_base.speculative.draft.n_max;
+        }
+
+        return c;
+    }
+
+    // load a prompt cache snapshot file into the cache; returns false and sets `err` on failure
+    bool load_prompt_cache_snapshot(const std::string & filepath, std::string & err, size_t & n_entries, size_t & n_bytes) {
+        GGML_ASSERT(prompt_cache != nullptr);
+
+        n_entries = 0;
+        n_bytes   = 0;
+
+        if (ctx_tgt == nullptr) {
+            err = "server is sleeping";
+            return false;
+        }
+
+        std::error_code ec;
+        if (!std::filesystem::exists(filepath, ec) || ec) {
+            err = "file not found";
+            return false;
+        }
+
+        std::ifstream in(filepath, std::ios::binary | std::ios::ate);
+        if (!in) {
+            err = "failed to open";
+            return false;
+        }
+
+        const std::streamsize fsize = in.tellg();
+        if (fsize < 0 || (uint64_t) fsize > SIZE_MAX) {
+            err = "failed to determine file size";
+            return false;
+        }
+
+        in.seekg(0, std::ios::beg);
+        std::vector<uint8_t> data((size_t) fsize);
+        if (!in.read((char *) data.data(), fsize)) {
+            err = "failed to read";
+            return false;
+        }
+
+        n_bytes = data.size();
+
+        const int64_t t_start = ggml_time_us();
+
+        if (!prompt_cache->snapshot_load(data.data(), data.size(), build_prompt_cache_compat(),
+                ctx_tgt, mctx != nullptr, n_ctx, n_ctx_slot())) {
+            err = "invalid or incompatible snapshot";
+            return false;
+        }
+
+        n_entries = prompt_cache->states.size();
+
+        SRV_INF("loaded prompt cache snapshot from '%s' in %.2f ms\n",
+                filepath.c_str(), (ggml_time_us() - t_start) / 1000.0);
+
+        return true;
+    }
+
+    // save the prompt cache to a snapshot file; returns false and sets `err` on failure
+    // note: requires model/context to be alive, do not call while sleeping
+    bool save_prompt_cache(const std::string & filepath, std::string & err, size_t & n_entries, size_t & n_bytes) {
+        n_entries = 0;
+        n_bytes   = 0;
+
+        if (prompt_cache == nullptr) {
+            err = "prompt cache is disabled";
+            return false;
+        }
+
+        if (ctx_tgt == nullptr) {
+            err = "server is sleeping";
+            return false;
+        }
+
+        // publish the newest idle slot prompts that never entered the prompt cache
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                SLT_WRN(slot, "%s", "skipping prompt cache snapshot: slot is still processing\n");
+                continue;
+            }
+            if (slot.prompt.n_tokens() > 0) {
+                SLT_INF(slot, "%s", "saving idle slot to the prompt cache snapshot\n");
+                slot.prompt_save(*prompt_cache);
+            }
+        }
+
+        // keep the saved contents within the configured limits and existing prefix compaction
+        prompt_cache->update();
+
+        const server_prompt_cache_compat compat = build_prompt_cache_compat();
+
+        const int64_t t_start = ggml_time_us();
+
+        std::vector<uint8_t> data;
+        if (!prompt_cache->snapshot_save(data, compat)) {
+            err = "failed to serialize";
+            return false;
+        }
+
+        if (!server_prompt_cache_snapshot_save_file(filepath, data)) {
+            err = "failed to write";
+            return false;
+        }
+
+        n_entries = prompt_cache->states.size();
+        n_bytes   = data.size();
+
+        SRV_INF("saved prompt cache snapshot with %zu entries (%.2f MiB) to '%s' in %.2f ms\n",
+                prompt_cache->states.size(), data.size() / (1024.0 * 1024.0),
+                filepath.c_str(), (ggml_time_us() - t_start) / 1000.0);
+
+        return true;
+    }
+
     server_response_reader get_response_reader() {
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
     }
@@ -5281,6 +5516,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
     }
     std::string filepath = params.slot_save_path + filename;
 
+    std::string ram_filepath;
+    if (!params.save_ram_path.empty()) {
+        ram_filepath = params.save_ram_path + filename;
+    }
+
     auto & rd = res->rd;
     {
         server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
@@ -5288,6 +5528,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.ram_filepath = ram_filepath;
         rd.post_task(std::move(task));
     }
 
@@ -5317,6 +5558,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     }
     std::string filepath = params.slot_save_path + filename;
 
+    std::string ram_filepath;
+    if (!params.save_ram_path.empty()) {
+        ram_filepath = params.save_ram_path + filename;
+    }
+
     auto & rd = res->rd;
     {
         server_task task(SERVER_TASK_TYPE_SLOT_RESTORE);
@@ -5324,6 +5570,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.ram_filepath = ram_filepath;
         rd.post_task(std::move(task));
     }
 
