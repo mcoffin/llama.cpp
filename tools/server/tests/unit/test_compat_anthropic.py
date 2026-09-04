@@ -72,6 +72,87 @@ def test_anthropic_messages_basic():
     assert "timings" not in res.body, "Anthropic API should not include timings field"
 
 
+def test_anthropic_messages_id_slot_honored():
+    """A top-level id_slot in the Anthropic request should survive the
+    Anthropic -> OAI conversion and pin the request to that slot, instead of
+    being dropped and falling back to normal idle-slot selection.
+
+    With all slots equally idle, default LRU selection ties toward the
+    highest-numbered slot (see get_available_slot()'s `<=` comparison), so
+    pinning to slot 0 here is what distinguishes "id_slot was honored" from
+    "id_slot was silently dropped"."""
+    global server
+    server.n_slots = 2
+    server.server_slots = True
+    server.start()
+
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 8,
+        "id_slot": 0,
+        "messages": [
+            {"role": "user", "content": "Say hello"}
+        ]
+    })
+    assert res.status_code == 200
+
+    res_slots = server.make_request("GET", "/slots")
+    assert res_slots.status_code == 200
+    slots = {slot["id"]: slot for slot in res_slots.body}
+    assert "id_task" in slots[0], "slot 0 should have processed the request"
+    assert "id_task" not in slots[1], "slot 1 should remain idle when id_slot=0 was requested"
+
+
+def test_anthropic_messages_verbose():
+    """A top-level verbose=true in the Anthropic request should survive the
+    Anthropic -> OAI conversion and cause the response to include the
+    __verbose debug field, mirroring /chat/completions' behavior."""
+    server.start()
+
+    for verbose in [True, False]:
+        res = server.make_request("POST", "/v1/messages", data={
+            "model": "test",
+            "max_tokens": 8,
+            "verbose": verbose,
+            "messages": [
+                {"role": "user", "content": "Say hello"}
+            ]
+        })
+        assert res.status_code == 200
+        if verbose:
+            assert "__verbose" in res.body
+            assert "prompt" in res.body["__verbose"]
+        else:
+            assert "__verbose" not in res.body
+
+
+def test_anthropic_messages_verbose_streaming():
+    """Same as test_anthropic_messages_verbose, but for the streaming path:
+    __verbose should show up on the message_start event (verbose=true) and
+    be absent altogether (verbose=false)."""
+    server.start()
+
+    for verbose in [True, False]:
+        res = server.make_stream_request("POST", "/v1/messages", data={
+            "model": "test",
+            "max_tokens": 8,
+            "verbose": verbose,
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "Say hello"}
+            ]
+        })
+
+        events = list(res)
+        verbose_events = [e for e in events if "__verbose" in e]
+        if verbose:
+            assert len(verbose_events) > 0, "Should have at least one event with __verbose"
+            message_start = next(e for e in events if e.get("type") == "message_start")
+            assert "__verbose" in message_start, "__verbose should be on message_start"
+        else:
+            assert len(verbose_events) == 0, "Should have no __verbose fields when verbose=False"
+
+
 def test_anthropic_messages_with_system():
     """Test messages with system prompt"""
     server.start()
