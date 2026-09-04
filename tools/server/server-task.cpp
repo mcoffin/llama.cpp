@@ -794,6 +794,11 @@ json server_task_result_cmpl_final::to_json_anthropic() {
         }}
     };
 
+    // extra fields for debugging purposes
+    if (verbose) {
+        res["__verbose"] = to_json_non_oaicompat();
+    }
+
     return res;
 }
 
@@ -961,18 +966,25 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
         });
     }
 
+    json message_delta_data = {
+        {"type", "message_delta"},
+        {"delta", {
+            {"stop_reason", stop_reason},
+            {"stop_sequence", stopping_word.empty() ? nullptr : json(stopping_word)}
+        }},
+        {"usage", {
+            {"output_tokens", n_decoded}
+        }}
+    };
+
+    // extra fields for debugging purposes
+    if (verbose) {
+        message_delta_data["__verbose"] = to_json_non_oaicompat();
+    }
+
     events.push_back({
         {"event", "message_delta"},
-        {"data", {
-            {"type", "message_delta"},
-            {"delta", {
-                {"stop_reason", stop_reason},
-                {"stop_sequence", stopping_word.empty() ? nullptr : json(stopping_word)}
-            }},
-            {"usage", {
-                {"output_tokens", n_decoded}
-            }}
-        }}
+        {"data", message_delta_data}
     });
 
     events.push_back({
@@ -1331,25 +1343,32 @@ json server_task_result_cmpl_partial::to_json_anthropic() {
     // (anthropic_thinking_block_started, anthropic_text_block_started)
 
     if (first) {
-        events.push_back({
-            {"event", "message_start"},
-            {"data", {
-                {"type", "message_start"},
-                {"message", {
-                    {"id", oaicompat_cmpl_id},
-                    {"type", "message"},
-                    {"role", "assistant"},
-                    {"content", json::array()},
-                    {"model", oaicompat_model},
-                    {"stop_reason", nullptr},
-                    {"stop_sequence", nullptr},
-                    {"usage", {
-                        {"cache_read_input_tokens", n_prompt_tokens_cache},
-                        {"input_tokens", n_prompt_tokens - n_prompt_tokens_cache},
-                        {"output_tokens", 0}
-                    }}
+        json message_start_data = {
+            {"type", "message_start"},
+            {"message", {
+                {"id", oaicompat_cmpl_id},
+                {"type", "message"},
+                {"role", "assistant"},
+                {"content", json::array()},
+                {"model", oaicompat_model},
+                {"stop_reason", nullptr},
+                {"stop_sequence", nullptr},
+                {"usage", {
+                    {"cache_read_input_tokens", n_prompt_tokens_cache},
+                    {"input_tokens", n_prompt_tokens - n_prompt_tokens_cache},
+                    {"output_tokens", 0}
                 }}
             }}
+        };
+
+        // extra fields for debugging purposes
+        if (verbose) {
+            message_start_data["__verbose"] = to_json_non_oaicompat();
+        }
+
+        events.push_back({
+            {"event", "message_start"},
+            {"data", message_start_data}
         });
     }
 
