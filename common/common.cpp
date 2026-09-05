@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -11,6 +12,7 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -1622,6 +1624,172 @@ done:
     return res;
 }
 
+
+// [NAN-DEBUG] Per-op non-finite detector.
+//
+// Dormant by default: while disarmed the `ask` phase returns false, so the
+// scheduler never hands us a tensor and we pay nothing at all. The set_logits
+// probe arms it on the first all-NaN logit vector. Because that fault is
+// absorbing (every subsequent decode reproduces it), the very next graph is
+// guaranteed to trip the check.
+//
+// We report the FIRST non-finite node in graph order -- that is the origin --
+// together with the finite-ness of each of its sources, which distinguishes an
+// op that CREATED the NaN from one merely propagating an already-bad input.
+std::atomic<bool> g_nan_debug_armed{false};
+
+static bool nan_debug_scan(const ggml_tensor * t, size_t & n_bad, size_t & n_total) {
+    n_bad = 0;
+    n_total = 0;
+    if (t == nullptr || t->buffer == nullptr) {
+        return false;
+    }
+    // Only float payloads are meaningful here; quantized weights would need
+    // dequantizing and are not what the fault manifests in.
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) {
+        return false;
+    }
+    const size_t nb = ggml_nbytes(t);
+    if (nb == 0 || nb > (size_t) 512*1024*1024) {
+        return false;
+    }
+
+    std::vector<uint8_t> buf(nb);
+    ggml_backend_tensor_get(t, buf.data(), 0, nb);
+
+    if (t->type == GGML_TYPE_F32) {
+        const float * p = (const float *) buf.data();
+        n_total = nb / sizeof(float);
+        for (size_t i = 0; i < n_total; ++i) {
+            if (!std::isfinite(p[i])) { ++n_bad; }
+        }
+    } else {
+        const ggml_fp16_t * p = (const ggml_fp16_t *) buf.data();
+        n_total = nb / sizeof(ggml_fp16_t);
+        for (size_t i = 0; i < n_total; ++i) {
+            if (!std::isfinite(ggml_fp16_to_fp32(p[i]))) { ++n_bad; }
+        }
+    }
+    return n_bad > 0;
+}
+
+// [NAN-DEBUG mode 2] State-only watch, active from startup.
+//
+// Mode 1 (above) is armed by the set_logits probe, i.e. only AFTER logits are
+// already NaN -- by which point the recurrent state is already poisoned, so it
+// can only ever name the carrier, never the writer. This mode fixes that: it
+// watches ONLY the `cache_*` tensors (~60 nodes per graph rather than ~600),
+// which is cheap enough to leave running permanently, so it catches the decode
+// where the state transitions finite -> NaN.
+//
+// On that transition it reports the node and its sources, then switches to a
+// full scan for the remainder of that graph to capture surrounding context,
+// then goes permanently quiet -- we only need the transition once.
+static bool   nan_debug_state_only = false;
+static bool   g_state_full_scan    = false;
+static bool   g_state_done         = false;
+static size_t g_state_reports      = 0;
+
+static void nan_debug_report(const char * tag, const ggml_tensor * t, size_t n_bad, size_t n_total) {
+    LOG_ERR("NAN-DEBUG-STATE: %s: name='%s' op=%s type=%s ne=[%lld,%lld,%lld,%lld] bad=%zu/%zu\n",
+            tag, t->name, ggml_op_name(t->op), ggml_type_name(t->type),
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            n_bad, n_total);
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = t->src[i];
+        if (src == nullptr) {
+            continue;
+        }
+        size_t sb = 0;
+        size_t st = 0;
+        const bool bad = nan_debug_scan(src, sb, st);
+        LOG_ERR("NAN-DEBUG-STATE:   src[%d] name='%s' op=%s type=%s -> %s (%zu/%zu)\n",
+                i, src->name, ggml_op_name(src->op), ggml_type_name(src->type),
+                bad ? "NON-FINITE" : (st ? "finite" : "unchecked"), sb, st);
+    }
+}
+
+static bool nan_debug_state_cb(struct ggml_tensor * t, bool ask) {
+    if (g_state_done) {
+        return false;
+    }
+    if (ask) {
+        // Cheap steady state: only the recurrent/KV cache tensors. After a
+        // transition is seen, widen to everything for the rest of the graph.
+        if (g_state_full_scan) {
+            return true;
+        }
+        // Recurrent state only: the SSM "s" and conv "r" tensors. cache_k/cache_v
+        // are the KV cache, which only goes non-finite AFTER the recurrent path
+        // poisons it (observed downstream at the last full-attention layer), so
+        // watching them costs ~20 pipeline drains per decode for no diagnostic
+        // value. Each accepted node forces a full ggml_backend_synchronize.
+        if (t->name[0] == '\0') {
+            return false;
+        }
+        return strstr(t->name, "cache_s_") != nullptr ||
+               strstr(t->name, "cache_r_") != nullptr;
+    }
+
+    size_t n_bad = 0;
+    size_t n_total = 0;
+    if (!nan_debug_scan(t, n_bad, n_total)) {
+        return true;
+    }
+
+    nan_debug_report(g_state_full_scan ? "context" : "TRANSITION", t, n_bad, n_total);
+
+    if (!g_state_full_scan) {
+        // First bad state tensor seen: widen for the rest of this graph.
+        g_state_full_scan = true;
+    }
+    if (++g_state_reports >= 40) {
+        LOG_ERR("NAN-DEBUG-STATE: report budget reached, going quiet\n");
+        g_state_done = true;
+    }
+    return true;
+}
+
+static bool nan_debug_eval_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/) {
+    if (nan_debug_state_only) {
+        return nan_debug_state_cb(t, ask);
+    }
+    if (!g_nan_debug_armed.load(std::memory_order_relaxed)) {
+        return false; // disarmed: decline observation entirely
+    }
+    if (ask) {
+        return true;  // armed: yes, hand us this node once computed
+    }
+
+    size_t n_bad = 0;
+    size_t n_total = 0;
+    if (!nan_debug_scan(t, n_bad, n_total)) {
+        return true;
+    }
+
+    LOG_ERR("NAN-DEBUG: FIRST non-finite NODE: name='%s' op=%s type=%s ne=[%lld,%lld,%lld,%lld] bad=%zu/%zu\n",
+            t->name, ggml_op_name(t->op), ggml_type_name(t->type),
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            n_bad, n_total);
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * s = t->src[i];
+        if (s == nullptr) {
+            continue;
+        }
+        size_t sb = 0;
+        size_t st = 0;
+        const bool bad = nan_debug_scan(s, sb, st);
+        LOG_ERR("NAN-DEBUG:   src[%d] name='%s' op=%s type=%s -> %s (%zu/%zu)\n",
+                i, s->name, ggml_op_name(s->op), ggml_type_name(s->type),
+                bad ? "NON-FINITE" : (st ? "finite" : "unchecked"), sb, st);
+    }
+
+    // One-shot: a sustained fault would otherwise flood the log.
+    g_nan_debug_armed.store(false, std::memory_order_relaxed);
+    return true;
+}
+
 static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
@@ -1741,8 +1909,19 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.pooling_type      = params.pooling_type;
     cparams.attention_type    = params.attention_type;
     cparams.flash_attn_type   = params.flash_attn_type;
-    cparams.cb_eval           = params.cb_eval;
-    cparams.cb_eval_user_data = params.cb_eval_user_data;
+    // [NAN-DEBUG] install the per-op finite check unless the caller wants the hook
+    if (params.cb_eval == nullptr && getenv("LLAMA_NAN_DEBUG_STATE") != nullptr) {
+        nan_debug_state_only = true;
+        cparams.cb_eval           = nan_debug_eval_cb;
+        cparams.cb_eval_user_data = nullptr;
+        LOG_INF("%s: NAN-DEBUG state watch active (cache_* tensors, from startup)\n", __func__);
+    } else if (params.cb_eval == nullptr && getenv("LLAMA_NAN_DEBUG_OPS") != nullptr) {
+        cparams.cb_eval           = nan_debug_eval_cb;
+        cparams.cb_eval_user_data = nullptr;
+    } else {
+        cparams.cb_eval           = params.cb_eval;
+        cparams.cb_eval_user_data = params.cb_eval_user_data;
+    }
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

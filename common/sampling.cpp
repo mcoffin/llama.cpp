@@ -158,6 +158,38 @@ struct common_sampler {
             }
         }
 
+        // [NAN-DEBUG] This is the live server path: common_sampler_sample calls
+        // set_logits(), never llama_sampler_sample(). A non-finite value here means
+        // the fault arrived from the compute graph. A clean array here, followed by
+        // NaN probabilities in the dist sampler, means the chain manufactured it.
+        {
+            static size_t n_hits = 0;
+            size_t n_nan = 0;
+            size_t n_inf = 0;
+            float  max_finite = -INFINITY;
+            for (size_t i = 0; i < cur.size(); ++i) {
+                const float v = cur[i].logit;
+                if (std::isnan(v)) {
+                    ++n_nan;
+                } else if (std::isinf(v)) {
+                    ++n_inf;
+                } else if (v > max_finite) {
+                    max_finite = v;
+                }
+            }
+            if (n_nan > 0 || n_inf > 0) {
+                ++n_hits;
+                // Arm the per-op check; the next graph will name the origin op.
+                g_nan_debug_armed.store(true, std::memory_order_relaxed);
+                if (n_hits <= 5 || n_hits % 500 == 0) {
+                    LOG_ERR("NAN-DEBUG: non-finite logits at set_logits: idx=%d branch=%s n_nan=%zu n_inf=%zu / %zu max_finite=%g hit=%zu\n",
+                            idx,
+                            sampled_probs ? "sampled_probs" : (sampled_logits ? "sampled_logits" : "full_logits"),
+                            n_nan, n_inf, cur.size(), (double) max_finite, n_hits);
+                }
+            }
+        }
+
         cur_p = { cur.data(), cur.size(), -1, false };
     }
 

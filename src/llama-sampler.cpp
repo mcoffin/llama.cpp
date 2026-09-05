@@ -944,6 +944,28 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
         }
     }
 
+    // [NAN-DEBUG] A single non-finite logit makes every comparison in every
+    // downstream sampler false, which silently degrades into the dist fallback
+    // and pins generation to one fixed token forever. Detect it here, where the
+    // values arrive straight from decode, so a graph fault is distinguishable
+    // from anything the samplers themselves do.
+    {
+        static size_t n_hits = 0;
+        size_t n_bad = 0;
+        for (size_t i = 0; i < cur.size(); ++i) {
+            if (!std::isfinite(cur[i].logit)) {
+                ++n_bad;
+            }
+        }
+        if (n_bad > 0) {
+            ++n_hits;
+            if (n_hits <= 5 || n_hits % 500 == 0) {
+                LLAMA_LOG_ERROR("NAN-DEBUG: non-finite logits at llama_sampler_sample (NOT the server path): idx=%d n_bad=%zu/%zu hit=%zu\n",
+                        idx, n_bad, cur.size(), n_hits);
+            }
+        }
+    }
+
     llama_token_data_array cur_p = {
         /* .data       = */ cur.data(),
         /* .size       = */ cur.size(),
@@ -1210,6 +1232,16 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     // fallback to the last token (don't think this can happen)
     assert(found);
     if (!found) {
+        // [NAN-DEBUG] This is what turns a numerical fault into an infinite loop:
+        // with NaN probs no candidate ever reaches sum_tgt, so selection collapses
+        // to a fixed index into the post-partial_sort permutation.
+        static size_t n_hits = 0;
+        ++n_hits;
+        if (n_hits <= 5 || n_hits % 500 == 0) {
+            LLAMA_LOG_ERROR("NAN-DEBUG: dist fallback: size=%zu sum_cum=%f sum_tgt=%f idx=%zu token=%d hit=%zu\n",
+                    cur_p->size, sum_cum, sum_tgt, cur_p->size - 1,
+                    cur_p->data[cur_p->size - 1].id, n_hits);
+        }
         cur_p->selected = cur_p->size - 1;
     }
 #else

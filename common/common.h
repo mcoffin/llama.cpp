@@ -11,6 +11,7 @@
 #include <list>
 #include <set>
 #include <sstream>
+#include <atomic>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -444,6 +445,10 @@ struct lr_opt {
 };
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
+
+// [NAN-DEBUG] Set by the set_logits probe on the first all-NaN logit vector.
+// Arms the per-op finite check installed when LLAMA_NAN_DEBUG_OPS is set.
+extern std::atomic<bool> g_nan_debug_armed;
 
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
