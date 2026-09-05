@@ -1888,9 +1888,11 @@ static void nan_debug_check_rs(llama_memory_i * mem, uint32_t n_tokens, bool has
 // LLAMA_NAN_DEBUG_CONV=1  report threshold crossings on the conv path
 //
 
+// 4 and 5 sit upstream of 0, in build_conv_state: gather -> reshape -> concat
 static const char * nan_debug_conv_tag(int which) {
-    static const char * tags[4] = { "conv_input", "conv_raw", "conv_silu", "v_conv" };
-    return (which >= 0 && which < 4) ? tags[which] : "?";
+    static const char * tags[6] = { "conv_input", "conv_raw", "conv_silu", "v_conv",
+                                    "rs_gather", "rs_reshaped" };
+    return (which >= 0 && which < 6) ? tags[which] : "?";
 }
 
 static void nan_debug_check_conv(llama_memory_i * mem, ggml_cgraph * gf) {
@@ -1902,7 +1904,7 @@ static void nan_debug_check_conv(llama_memory_i * mem, ggml_cgraph * gf) {
     static bool   done     = false;
     static size_t n_decode = 0;
     // decades[which][il]: highest power-of-ten band already reported for that point
-    static std::vector<int> decades[4];
+    static std::vector<int> decades[6];
 
     if (done) {
         return;
@@ -1924,28 +1926,45 @@ static void nan_debug_check_conv(llama_memory_i * mem, ggml_cgraph * gf) {
     const size_t n_layer = recr->r_l.size();
 
     if (decades[0].empty()) {
-        for (int which = 0; which < 4; ++which) {
+        for (int which = 0; which < 6; ++which) {
             decades[which].assign(n_layer, -1);
         }
     }
 
     n_decode++;
 
-    char name[64];
     size_t n_found = 0;
 
-    for (size_t il = 0; il < n_layer; ++il) {
-        for (int which = 0; which < 4; ++which) {
-            snprintf(name, sizeof(name), "dbg_conv%d_l%zu", which, il);
-            ggml_tensor * t = ggml_graph_get_tensor(gf, name);
-            if (t == nullptr) {
-                continue; // not a recurrent layer, or probe not on this graph
+    // One pass over the graph. Looking each probe up by name instead cost an
+    // O(n_nodes) scan per probe, which dominated the probe's runtime.
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (strncmp(t->name, "dbg_conv", 8) != 0) {
+            continue;
+        }
+        int which = -1;
+        int ilx   = -1;
+        if (sscanf(t->name, "dbg_conv%d_l%d", &which, &ilx) == 2) {
+            const size_t il = (size_t) ilx;
+            if (which < 0 || which >= 6 || il >= n_layer) {
+                continue;
             }
             n_found++;
 
             float val = 0.0f;
             ggml_backend_tensor_get(t, &val, 0, sizeof(val));
 
+            // A non-finite L1 means the tensor itself holds NaN/inf. Report it
+            // once per point per layer - this is the interesting case, and an
+            // earlier version silently skipped it because NaN > 0 is false.
+            if (!std::isfinite(val)) {
+                if (decades[which][il] < 99) {
+                    decades[which][il] = 99;
+                    LLAMA_LOG_ERROR("NAN-DEBUG-CONV: decode=%zu l%zu %s l1=NON-FINITE (%g)\n",
+                            n_decode, il, nan_debug_conv_tag(which), (double) val);
+                }
+                continue;
+            }
             if (!(val > 0.0f)) {
                 continue;
             }

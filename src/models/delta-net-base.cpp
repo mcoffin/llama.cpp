@@ -1,5 +1,25 @@
 #include "models.h"
 
+#include <cstdlib>
+
+// [NAN-DEBUG] probes on the state gather, ahead of the conv path. conv_input was
+// measured already non-finite at its first probe point, and the NaN sits in the
+// one column that never reaches cache_r, so the gather/reshape/concat are what
+// remain between a finite cache_r and a bad conv_input.
+// Duplicated from qwen35moe.cpp rather than shared: debug-only, internal linkage.
+static bool nan_debug_conv_active() {
+    static const bool active = getenv("LLAMA_NAN_DEBUG_CONV") != nullptr;
+    return active;
+}
+
+static void nan_debug_add_conv_probe(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * x, int which, int il) {
+    ggml_tensor * t = ggml_cont(ctx0, x);
+    t = ggml_sum(ctx0, ggml_abs(ctx0, t));
+    ggml_format_name(t, "dbg_conv%d_l%d", which, il);
+    ggml_set_output(t);
+    ggml_build_forward_expand(gf, t);
+}
+
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
@@ -463,8 +483,16 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
+    if (nan_debug_conv_active()) {
+        nan_debug_add_conv_probe(ctx0, gf, conv_states, 4, il);
+    }
+
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
+
+    if (nan_debug_conv_active()) {
+        nan_debug_add_conv_probe(ctx0, gf, conv_states, 5, il);
+    }
 
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
