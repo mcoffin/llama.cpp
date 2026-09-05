@@ -7,6 +7,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -1641,6 +1644,238 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+//
+// [NAN-DEBUG] host-side watch for the recurrent (SSM/conv) state
+//
+// An earlier version of this watch used a cb_eval callback. That was a mistake:
+// installing cb_eval makes ggml_backend_sched submit the graph in fragments with
+// a device fence after each one, which masks a missing barrier. The fault stopped
+// reproducing under it. This version reads the state after the graph is already
+// complete, so graph submission stays identical to production.
+//
+// LLAMA_NAN_DEBUG_RS=1  check after every decode
+// LLAMA_NAN_DEBUG_RS=2  check only after decodes that produce output, where the
+//                       caller already synchronizes, so no sync is added at all
+//
+
+struct nan_debug_rs_stat {
+    size_t n_bad   = 0;
+    size_t n_total = 0;
+    size_t i_first = 0;
+    // contiguous runs of non-finite values. The GDN state write covers one column
+    // per workgroup (128 elements here), so a single 128-aligned run of 128 means
+    // exactly one workgroup, while scattered runs mean something else.
+    size_t n_runs  = 0;
+    size_t run_beg[4] = {0};
+    size_t run_len[4] = {0};
+    // largest finite magnitude in the tensor. Progressive growth here would mean
+    // the recurrence is overflowing to inf, which becomes NaN via 0 * inf.
+    float  max_abs = 0.0f;
+    // split the non-finite count. The overflow route predicts NaN via 0 * inf,
+    // so a state holding inf instead would point somewhere else.
+    size_t n_nan = 0;
+    size_t n_inf = 0;
+};
+
+static llama_memory_recurrent * nan_debug_recurrent(llama_memory_i * mem) {
+    if (auto * m = dynamic_cast<llama_memory_recurrent *>(mem)) {
+        return m;
+    }
+    if (auto * m = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return m->get_mem_recr();
+    }
+    if (auto * m = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return m->get_mem_recr();
+    }
+    return nullptr;
+}
+
+static nan_debug_rs_stat nan_debug_scan_rs(const ggml_tensor * t, std::vector<uint8_t> & buf) {
+    nan_debug_rs_stat res;
+
+    if (t == nullptr || t->buffer == nullptr || t->type != GGML_TYPE_F32) {
+        return res;
+    }
+
+    const size_t nb = ggml_nbytes(t);
+    buf.resize(nb);
+    ggml_backend_tensor_get(t, buf.data(), 0, nb);
+
+    const float * p = (const float *) buf.data();
+    res.n_total = nb / sizeof(float);
+
+    bool in_run = false;
+    for (size_t i = 0; i < res.n_total; ++i) {
+        if (std::isfinite(p[i])) {
+            in_run = false;
+            const float a = std::fabs(p[i]);
+            if (a > res.max_abs) {
+                res.max_abs = a;
+            }
+            continue;
+        }
+        if (res.n_bad == 0) {
+            res.i_first = i;
+        }
+        res.n_bad++;
+        if (std::isnan(p[i])) {
+            res.n_nan++;
+        } else {
+            res.n_inf++;
+        }
+
+        if (in_run) {
+            if (res.n_runs <= 4) {
+                res.run_len[res.n_runs - 1]++;
+            }
+            continue;
+        }
+        in_run = true;
+        res.n_runs++;
+        if (res.n_runs <= 4) {
+            res.run_beg[res.n_runs - 1] = i;
+            res.run_len[res.n_runs - 1] = 1;
+        }
+    }
+
+    return res;
+}
+
+static void nan_debug_scan_all(const std::vector<ggml_tensor *> & tensors,
+                               std::vector<nan_debug_rs_stat> & out,
+                               std::vector<uint8_t> & buf) {
+    out.resize(tensors.size());
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        out[i] = nan_debug_scan_rs(tensors[i], buf);
+    }
+}
+
+// log every layer that currently holds a non-finite value, so a single bad write
+// is distinguishable from corruption that already spread across layers
+static void nan_debug_dump_context(const char * tag, const std::vector<nan_debug_rs_stat> & stats) {
+    for (size_t il = 0; il < stats.size(); ++il) {
+        if (stats[il].n_bad == 0) {
+            continue;
+        }
+        LLAMA_LOG_ERROR("NAN-DEBUG-RS:   also %s l%zu bad=%zu/%zu first=%zu max_abs=%g\n",
+                tag, il, stats[il].n_bad, stats[il].n_total, stats[il].i_first,
+                (double) stats[il].max_abs);
+    }
+}
+
+static void nan_debug_report_new(const char * tag,
+                                 const std::vector<nan_debug_rs_stat> & stats,
+                                 std::vector<bool> & seen,
+                                 size_t n_decode, uint32_t n_tokens,
+                                 bool & any) {
+    for (size_t il = 0; il < stats.size(); ++il) {
+        const bool bad = stats[il].n_bad > 0;
+        if (!bad || seen[il]) {
+            seen[il] = bad;
+            continue;
+        }
+        seen[il] = true;
+        any = true;
+        const auto & st = stats[il];
+        LLAMA_LOG_ERROR("NAN-DEBUG-RS: TRANSITION decode=%zu n_tokens=%u: %s l%zu bad=%zu/%zu first=%zu runs=%zu [%zu+%zu][%zu+%zu][%zu+%zu][%zu+%zu]\n",
+                n_decode, n_tokens, tag, il,
+                st.n_bad, st.n_total, st.i_first, st.n_runs,
+                st.run_beg[0], st.run_len[0], st.run_beg[1], st.run_len[1],
+                st.run_beg[2], st.run_len[2], st.run_beg[3], st.run_len[3]);
+        LLAMA_LOG_ERROR("NAN-DEBUG-RS:   %s l%zu n_nan=%zu n_inf=%zu max_abs_finite=%g\n",
+                tag, il, st.n_nan, st.n_inf, (double) st.max_abs);
+    }
+}
+
+// Report state magnitude only when a layer enters a new power-of-ten band at or
+// above 1e4. Silent while magnitudes are normal, so it costs nothing to leave on,
+// and it produces the growth curve if the recurrence is running away.
+static void nan_debug_report_growth(const char * tag,
+                                    const std::vector<nan_debug_rs_stat> & stats,
+                                    std::vector<int> & decades,
+                                    size_t n_decode) {
+    if (decades.size() != stats.size()) {
+        decades.assign(stats.size(), 0);
+    }
+    for (size_t il = 0; il < stats.size(); ++il) {
+        if (!(stats[il].max_abs > 0.0f)) {
+            continue;
+        }
+        const int dec = (int) std::floor(std::log10((double) stats[il].max_abs));
+        if (dec < 4 || dec <= decades[il]) {
+            continue;
+        }
+        decades[il] = dec;
+        LLAMA_LOG_ERROR("NAN-DEBUG-RS: GROWTH decode=%zu: %s l%zu max_abs=%g (1e%d band)\n",
+                n_decode, tag, il, (double) stats[il].max_abs, dec);
+    }
+}
+
+static void nan_debug_check_rs(llama_memory_i * mem, uint32_t n_tokens, bool has_output) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * env = getenv("LLAMA_NAN_DEBUG_RS");
+        mode = env ? atoi(env) : 0;
+    }
+    if (mode == 0 || (mode == 2 && !has_output)) {
+        return;
+    }
+
+    static bool   done      = false;
+    static size_t n_decode  = 0;
+    static size_t n_reports = 0;
+    static std::vector<bool> seen_r;
+    static std::vector<bool> seen_s;
+
+    if (done) {
+        return;
+    }
+
+    llama_memory_recurrent * recr = nan_debug_recurrent(mem);
+    if (recr == nullptr) {
+        LLAMA_LOG_ERROR("NAN-DEBUG-RS: no recurrent memory reachable, watch DISABLED\n");
+        done = true;
+        return;
+    }
+
+    if (seen_s.empty()) {
+        seen_r.assign(recr->r_l.size(), false);
+        seen_s.assign(recr->s_l.size(), false);
+        LLAMA_LOG_INFO("NAN-DEBUG-RS: watch active, mode=%d, %zu r_l and %zu s_l tensors\n",
+                mode, recr->r_l.size(), recr->s_l.size());
+    }
+
+    n_decode++;
+
+    std::vector<uint8_t> buf;
+    std::vector<nan_debug_rs_stat> stats_r;
+    std::vector<nan_debug_rs_stat> stats_s;
+
+    nan_debug_scan_all(recr->r_l, stats_r, buf);
+    nan_debug_scan_all(recr->s_l, stats_s, buf);
+
+    static std::vector<int> dec_r;
+    static std::vector<int> dec_s;
+    nan_debug_report_growth("cache_r", stats_r, dec_r, n_decode);
+    nan_debug_report_growth("cache_s", stats_s, dec_s, n_decode);
+
+    bool any = false;
+    nan_debug_report_new("cache_r", stats_r, seen_r, n_decode, n_tokens, any);
+    nan_debug_report_new("cache_s", stats_s, seen_s, n_decode, n_tokens, any);
+
+    if (!any) {
+        return;
+    }
+
+    nan_debug_dump_context("cache_r", stats_r);
+    nan_debug_dump_context("cache_s", stats_s);
+
+    if (++n_reports >= 20) {
+        LLAMA_LOG_ERROR("NAN-DEBUG-RS: report budget reached, going quiet\n");
+        done = true;
+    }
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -2032,6 +2267,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    nan_debug_check_rs(memory.get(), batch_inp.n_tokens, n_outputs > 0);
 
     return 0;
 }

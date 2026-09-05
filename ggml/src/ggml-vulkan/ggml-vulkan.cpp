@@ -2189,6 +2189,10 @@ std::mutex vk_memory_logger::log_mutex;
 static bool vk_perf_logger_enabled = false;
 static bool vk_perf_logger_concurrent = false;
 static bool vk_enable_sync_logger = false;
+// [NAN-DEBUG] force a barrier between every node, to test whether the fault
+// depends on a missing one. Unlike a cb_eval hook this keeps the graph in one
+// submission, so it adds no fences and does not reset the backend state.
+static bool vk_force_sync = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
@@ -7540,6 +7544,7 @@ static void ggml_vk_instance_init() {
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
+    vk_force_sync = getenv("GGML_VK_FORCE_SYNC") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
     if (GGML_VK_PIPELINE_STATS != nullptr) {
@@ -15757,7 +15762,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             }
         }
 
-        if (need_sync) {
+        if (need_sync || vk_force_sync) {
             if (vk_enable_sync_logger) {
                 std::cerr <<  "sync" << std::endl;
             }
