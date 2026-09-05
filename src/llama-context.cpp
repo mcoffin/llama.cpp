@@ -18,6 +18,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1876,6 +1877,99 @@ static void nan_debug_check_rs(llama_memory_i * mem, uint32_t n_tokens, bool has
     }
 }
 
+//
+// [NAN-DEBUG] host-side readout for the conv-path probes
+//
+// The probe nodes themselves are added to the graph in the qwen35moe builder
+// (src/models/qwen35moe.cpp), gated on the same LLAMA_NAN_DEBUG_CONV env var.
+// This side just locates them by name in the computed graph and reports
+// threshold crossings, mirroring nan_debug_check_rs above.
+//
+// LLAMA_NAN_DEBUG_CONV=1  report threshold crossings on the conv path
+//
+
+static const char * nan_debug_conv_tag(int which) {
+    static const char * tags[4] = { "conv_input", "conv_raw", "conv_silu", "v_conv" };
+    return (which >= 0 && which < 4) ? tags[which] : "?";
+}
+
+static void nan_debug_check_conv(llama_memory_i * mem, ggml_cgraph * gf) {
+    static bool active = getenv("LLAMA_NAN_DEBUG_CONV") != nullptr;
+    if (!active) {
+        return;
+    }
+
+    static bool   done     = false;
+    static size_t n_decode = 0;
+    // decades[which][il]: highest power-of-ten band already reported for that point
+    static std::vector<int> decades[4];
+
+    if (done) {
+        return;
+    }
+
+    if (gf == nullptr) {
+        LLAMA_LOG_ERROR("NAN-DEBUG-CONV: no graph available, watch DISABLED\n");
+        done = true;
+        return;
+    }
+
+    llama_memory_recurrent * recr = nan_debug_recurrent(mem);
+    if (recr == nullptr) {
+        LLAMA_LOG_ERROR("NAN-DEBUG-CONV: no recurrent memory reachable, watch DISABLED\n");
+        done = true;
+        return;
+    }
+
+    const size_t n_layer = recr->r_l.size();
+
+    if (decades[0].empty()) {
+        for (int which = 0; which < 4; ++which) {
+            decades[which].assign(n_layer, -1);
+        }
+    }
+
+    n_decode++;
+
+    char name[64];
+    size_t n_found = 0;
+
+    for (size_t il = 0; il < n_layer; ++il) {
+        for (int which = 0; which < 4; ++which) {
+            snprintf(name, sizeof(name), "dbg_conv%d_l%zu", which, il);
+            ggml_tensor * t = ggml_graph_get_tensor(gf, name);
+            if (t == nullptr) {
+                continue; // not a recurrent layer, or probe not on this graph
+            }
+            n_found++;
+
+            float val = 0.0f;
+            ggml_backend_tensor_get(t, &val, 0, sizeof(val));
+
+            if (!(val > 0.0f)) {
+                continue;
+            }
+            const int dec = (int) std::floor(std::log10((double) val));
+            if (dec < 6 || dec <= decades[which][il]) {
+                continue;
+            }
+            decades[which][il] = dec;
+            LLAMA_LOG_ERROR("NAN-DEBUG-CONV: decode=%zu l%zu %s l1=%g (1e%d band)\n",
+                    n_decode, il, nan_debug_conv_tag(which), (double) val, dec);
+        }
+    }
+
+    if (n_decode == 1) {
+        if (n_found == 0) {
+            LLAMA_LOG_ERROR("NAN-DEBUG-CONV: probe active but found no dbg_conv* tensors in the graph, watch DISABLED\n");
+            done = true;
+            return;
+        }
+        LLAMA_LOG_INFO("NAN-DEBUG-CONV: watch active, %zu probe tensors across %zu layers\n",
+                n_found, n_layer);
+    }
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -2269,6 +2363,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     //synchronize();
 
     nan_debug_check_rs(memory.get(), batch_inp.n_tokens, n_outputs > 0);
+    nan_debug_check_conv(memory.get(), gf_res_prev ? gf_res_prev->get_gf() : nullptr);
 
     return 0;
 }

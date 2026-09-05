@@ -1,6 +1,38 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+
+//
+// [NAN-DEBUG] graph-embedded probes for the linear-attention conv path
+//
+// The host-side watch on r_l/s_l (see llama-context.cpp) never catches this fault:
+// the value that blows up the SSM state is huge but finite, not NaN, until well
+// after it has already propagated. These probes bracket the conv path itself so
+// the exact step that introduces the huge magnitude can be identified.
+//
+// Nodes are added to the graph, not read via cb_eval: installing cb_eval makes
+// ggml_backend_sched submit the graph in fragments with a device fence after each
+// one, which perturbs the fault being measured and made it stop reproducing.
+//
+// LLAMA_NAN_DEBUG_CONV=1  add the probes and report threshold crossings
+//
+
+static bool nan_debug_conv_active() {
+    static const bool active = getenv("LLAMA_NAN_DEBUG_CONV") != nullptr;
+    return active;
+}
+
+// L1 norm (sum of abs), not sum of squares: values here can reach ~1e34, and
+// squaring that overflows f32 to inf.
+static void nan_debug_add_conv_probe(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * x, int which, int il) {
+    ggml_tensor * t = ggml_cont(ctx0, x);
+    t = ggml_sum(ctx0, ggml_abs(ctx0, t));
+    ggml_format_name(t, "dbg_conv%d_l%d", which, il);
+    ggml_set_output(t);
+    ggml_build_forward_expand(gf, t);
+}
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -412,11 +444,23 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
+    if (nan_debug_conv_active()) {
+        nan_debug_add_conv_probe(ctx0, gf, conv_input, 0, il);
+    }
+
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
+    if (nan_debug_conv_active()) {
+        nan_debug_add_conv_probe(ctx0, gf, conv_output_proper, 1, il);
+    }
+
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);
+
+    if (nan_debug_conv_active()) {
+        nan_debug_add_conv_probe(ctx0, gf, conv_output_silu, 2, il);
+    }
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
@@ -446,6 +490,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(q_conv, "q_conv", il);
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
+
+    if (nan_debug_conv_active()) {
+        nan_debug_add_conv_probe(ctx0, gf, v_conv, 3, il);
+    }
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
