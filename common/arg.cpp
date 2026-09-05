@@ -1719,9 +1719,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
-            if (value == 0 && !params.save_ram_path.empty()) {
-                throw std::invalid_argument("--save-ram-path requires --cache-ram to be enabled");
-            }
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -3642,23 +3639,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // if doesn't end with DIRECTORY_SEPARATOR, add it
             if (!params.slot_save_path.empty() && params.slot_save_path[params.slot_save_path.size() - 1] != DIRECTORY_SEPARATOR) {
                 params.slot_save_path += DIRECTORY_SEPARATOR;
-            }
-        }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--save-ram-path"}, "PATH",
-        "directory for saving and restoring the host prompt cache snapshot via the /slots save/restore actions (default: disabled)",
-        [](common_params & params, const std::string & value) {
-            if (params.cache_ram_mib == 0) {
-                throw std::invalid_argument("--save-ram-path requires --cache-ram to be enabled");
-            }
-            params.save_ram_path = value;
-            if (!fs_is_directory(params.save_ram_path)) {
-                throw std::invalid_argument("not a directory: " + value);
-            }
-            // if doesn't end with DIRECTORY_SEPARATOR, add it
-            if (!params.save_ram_path.empty() && params.save_ram_path[params.save_ram_path.size() - 1] != DIRECTORY_SEPARATOR) {
-                params.save_ram_path += DIRECTORY_SEPARATOR;
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));

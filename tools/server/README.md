@@ -225,7 +225,6 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
-| `--save-ram-path PATH` | directory for saving and restoring the host prompt cache snapshot via the /slots save/restore actions (default: disabled) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -1154,8 +1153,6 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
 
-When the server is started with `--save-ram-path`, the host prompt cache snapshot is also saved to that directory using the same `filename`. The save fails (500) when the snapshot cannot be written, leaving the slot file untouched.
-
 **Response format**
 
 ```json
@@ -1166,24 +1163,15 @@ When the server is started with `--save-ram-path`, the host prompt cache snapsho
     "n_written": 14309796,
     "timings": {
         "save_ms": 49.865
-    },
-    "ram": {
-        "n_entries": 12,
-        "n_bytes": 3456789,
-        "save_ms": 12.345
     }
 }
 ```
-
-The `ram` object is only present when `--save-ram-path` is set.
 
 ### POST `/slots/{id_slot}?action=restore`: Restore the prompt cache of the specified slot from a file.
 
 *Options:*
 
 `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
-
-When the server is started with `--save-ram-path`, the host prompt cache snapshot is also loaded from that directory using the same `filename`. The slot is restored first; a missing, malformed or incompatible snapshot makes the request fail (400) while the restored slot is kept.
 
 **Response format**
 
@@ -1195,16 +1183,9 @@ When the server is started with `--save-ram-path`, the host prompt cache snapsho
     "n_read": 14309796,
     "timings": {
         "restore_ms": 42.937
-    },
-    "ram": {
-        "n_entries": 12,
-        "n_bytes": 3456789,
-        "restore_ms": 15.678
     }
 }
 ```
-
-The `ram` object is only present when `--save-ram-path` is set.
 
 ### POST `/slots/{id_slot}?action=erase`: Erase the prompt cache of the specified slot.
 
@@ -2100,14 +2081,6 @@ Note that the following endpoints are exempt from being considered as incoming t
 - `GET /props`
 - `GET /models`
 - `GET /metrics`
-
-## Prompt cache warm restart
-
-`--save-ram-path PATH` gives the host-memory prompt cache (`--cache-ram`) an explicit warm-restart mechanism through the `/slots/{id}` actions. When the flag is set, `action=save` additionally writes a snapshot of the host prompt cache (including any prompts still sitting in idle slots) to `PATH/<filename>`, and `action=restore` additionally loads it back. There is no automatic snapshot load at startup or save at shutdown; the server's own SIGKILL, crash or clean-shutdown behavior never touches the snapshot files. The write is atomic: a temporary sibling file is written and renamed over the target file, and a failed write leaves the previous snapshot untouched.
-
-A snapshot is tied to the exact build and configuration it was written with (model file, context size, KV types, RoPE/SWA/speculative settings). On `action=restore`, a missing, malformed or incompatible file fails the request (400) without touching the cache: no entry is applied unless the whole snapshot validates. The snapshot is not portable across llama.cpp upgrades, model changes or moved model files; remove it when the model or context configuration changes. `--save-ram-path` requires `--cache-ram` to be enabled, must point to an existing directory, and is a server-only option.
-
-Note that a prompt cache snapshot can be large, close to the configured `--cache-ram` size. If `--save-ram-path` points to the same directory as `--slot-save-path`, the slot save file overwrites the prompt cache snapshot (same `filename` is used for both); point the flags at different directories to keep both files.
 
 ## More examples
 
