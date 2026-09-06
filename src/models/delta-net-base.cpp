@@ -494,11 +494,26 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         nan_debug_add_conv_probe(ctx0, gf, conv_states, 5, il);
     }
 
+    if (nan_debug_conv_active()) {
+        nan_debug_add_conv_probe(ctx0, gf, qkv_mixed, 6, il);
+    }
+
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
+
+    // [NAN-DEBUG] probe 7: concat copies the src0 region verbatim, so the first
+    // conv_kernel_size-1 columns of conv_input must equal conv_states exactly.
+    // A non-zero difference means concat's read of conv_states disagreed with the
+    // probe's read of it - i.e. the two reads saw different memory.
+    if (nan_debug_conv_active()) {
+        ggml_tensor * dst_src0 = ggml_view_3d(ctx0, conv_input,
+                conv_kernel_size - 1, conv_channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2], 0);
+        nan_debug_add_conv_probe(ctx0, gf, ggml_sub(ctx0, ggml_cont(ctx0, dst_src0), conv_states), 7, il);
+    }
 
     const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
 

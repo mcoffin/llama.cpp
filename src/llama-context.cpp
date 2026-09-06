@@ -1890,9 +1890,9 @@ static void nan_debug_check_rs(llama_memory_i * mem, uint32_t n_tokens, bool has
 
 // 4 and 5 sit upstream of 0, in build_conv_state: gather -> reshape -> concat
 static const char * nan_debug_conv_tag(int which) {
-    static const char * tags[6] = { "conv_input", "conv_raw", "conv_silu", "v_conv",
-                                    "rs_gather", "rs_reshaped" };
-    return (which >= 0 && which < 6) ? tags[which] : "?";
+    static const char * tags[8] = { "conv_input", "conv_raw", "conv_silu", "v_conv",
+                                    "rs_gather", "rs_reshaped", "qkv_mixed", "src0_identity" };
+    return (which >= 0 && which < 8) ? tags[which] : "?";
 }
 
 static void nan_debug_check_conv(llama_memory_i * mem, ggml_cgraph * gf) {
@@ -1904,7 +1904,7 @@ static void nan_debug_check_conv(llama_memory_i * mem, ggml_cgraph * gf) {
     static bool   done     = false;
     static size_t n_decode = 0;
     // decades[which][il]: highest power-of-ten band already reported for that point
-    static std::vector<int> decades[6];
+    static std::vector<int> decades[8];
 
     if (done) {
         return;
@@ -1926,7 +1926,7 @@ static void nan_debug_check_conv(llama_memory_i * mem, ggml_cgraph * gf) {
     const size_t n_layer = recr->r_l.size();
 
     if (decades[0].empty()) {
-        for (int which = 0; which < 6; ++which) {
+        for (int which = 0; which < 8; ++which) {
             decades[which].assign(n_layer, -1);
         }
     }
@@ -1946,7 +1946,7 @@ static void nan_debug_check_conv(llama_memory_i * mem, ggml_cgraph * gf) {
         int ilx   = -1;
         if (sscanf(t->name, "dbg_conv%d_l%d", &which, &ilx) == 2) {
             const size_t il = (size_t) ilx;
-            if (which < 0 || which >= 6 || il >= n_layer) {
+            if (which < 0 || which >= 8 || il >= n_layer) {
                 continue;
             }
             n_found++;
@@ -1966,6 +1966,15 @@ static void nan_debug_check_conv(llama_memory_i * mem, ggml_cgraph * gf) {
                 continue;
             }
             if (!(val > 0.0f)) {
+                continue;
+            }
+            // probe 7 is a difference that must be exactly 0; report any non-zero
+            if (which == 7) {
+                if (decades[7][il] < 0) {
+                    decades[7][il] = 0;
+                    LLAMA_LOG_ERROR("NAN-DEBUG-CONV: decode=%zu l%zu src0_identity NON-ZERO l1=%g (concat read != probe read)\n",
+                            n_decode, il, (double) val);
+                }
                 continue;
             }
             const int dec = (int) std::floor(std::log10((double) val));
